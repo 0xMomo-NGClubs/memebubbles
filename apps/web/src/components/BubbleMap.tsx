@@ -27,7 +27,11 @@ function calcRadiusFromMarketCap(marketCap: number, minMarketCap: number, maxMar
   const logMin = Math.log10(minV);
   const logMax = Math.log10(maxV);
 
-  const t = logMax === logMin ? 0.5 : clamp((logV - logMin) / (logMax - logMin), 0, 1);
+  const t0 = logMax === logMin ? 0.5 : clamp((logV - logMin) / (logMax - logMin), 0, 1);
+
+  const curve = 2.4;
+  const t = Math.pow(t0, curve);
+
   return minR + (maxR - minR) * t;
 }
 
@@ -415,7 +419,29 @@ export function BubbleMap() {
 
     sim.nodes(next);
 
-    sim.velocityDecay(0.22);
+    sim.velocityDecay(0.18);
+
+    const wiggleForce = (() => {
+      let simNodes: SimNode[] = [];
+
+      const f = (alpha: number) => {
+        const t = Date.now() / 1000;
+        for (const n of simNodes) {
+          const seed = hashToInt(n.id);
+          const phase = (seed % 10_000) / 10_000;
+          const a = (t * 0.7 + phase) * Math.PI * 2;
+          const amp = (0.035 + (seed % 1000) / 1000 * 0.02) * alpha;
+          n.vx += Math.cos(a) * amp;
+          n.vy += Math.sin(a) * amp;
+        }
+      };
+
+      f.initialize = (nodes: SimNode[]) => {
+        simNodes = nodes;
+      };
+
+      return f;
+    })();
 
     sim
       .force("charge", forceManyBody().strength(-18))
@@ -423,6 +449,8 @@ export function BubbleMap() {
       .force("y", forceY<SimNode>((d) => d.ty).strength(0.16))
       .force("collide", forceCollide<SimNode>().radius((d) => d.r + 2).iterations(2))
       .force("center", forceCenter(width / 2, height / 2).strength(0.02))
+      .force("wiggle", wiggleForce)
+      .alphaTarget(0.02)
       .alpha(0.9)
       .restart();
 

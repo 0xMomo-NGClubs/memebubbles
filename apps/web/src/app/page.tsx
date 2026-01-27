@@ -7,7 +7,7 @@ export default function Home() {
         <header className="flex flex-col gap-1 md:flex-row md:items-end md:justify-between">
           <div>
             <h1 className="text-xl font-bold tracking-tight">Meme Bubbles</h1>
-            <p className="text-sm text-[color:var(--color-muted)]">boosts 热度泡泡图（Top 30 / 30s 刷新）</p>
+            <p className="text-sm text-[color:var(--color-muted)]">热度泡泡图（Top 30 / 30s 刷新）</p>
           </div>
           <div className="text-sm text-[color:var(--color-muted)]">数据：Dexscreener → Fastify 封装</div>
         </header>

@@ -18,7 +18,20 @@ function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
 
-function calcRadius(score: number, minR: number, maxR: number) {
+function calcRadiusFromMarketCap(marketCap: number, minMarketCap: number, maxMarketCap: number, minR: number, maxR: number) {
+  const v = Math.max(1, marketCap);
+  const minV = Math.max(1, minMarketCap);
+  const maxV = Math.max(minV + 1, maxMarketCap);
+
+  const logV = Math.log10(v);
+  const logMin = Math.log10(minV);
+  const logMax = Math.log10(maxV);
+
+  const t = logMax === logMin ? 0.5 : clamp((logV - logMin) / (logMax - logMin), 0, 1);
+  return minR + (maxR - minR) * t;
+}
+
+function calcRadiusFallback(score: number, minR: number, maxR: number) {
   const v = Math.sqrt(Math.max(0, score));
   const t = clamp(v / 32, 0, 1);
   return minR + (maxR - minR) * t;
@@ -56,17 +69,63 @@ function hashToInt(s: string) {
   return h >>> 0;
 }
 
-function pickTarget(tokenAddress: string, width: number, height: number, margin: number) {
-  const h1 = hashToInt(tokenAddress);
-  const h2 = hashToInt(`y:${tokenAddress}`);
+type Target = { tx: number; ty: number };
 
+function generateTargets(count: number, width: number, height: number, margin: number): Target[] {
   const w = Math.max(1, width - margin * 2);
   const h = Math.max(1, height - margin * 2);
 
-  const tx = margin + ((h1 % 10_000) / 10_000) * w;
-  const ty = margin + ((h2 % 10_000) / 10_000) * h;
+  const cols = Math.max(1, Math.ceil(Math.sqrt((count * w) / h)));
+  const rows = Math.max(1, Math.ceil(count / cols));
 
-  return { tx, ty };
+  const stepX = w / cols;
+  const stepY = h / rows;
+
+  const out: Target[] = [];
+
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      if (out.length >= count) return out;
+
+      const offsetX = (row % 2) * (stepX * 0.5);
+      const tx = margin + (col + 0.5) * stepX + offsetX;
+      const ty = margin + (row + 0.5) * stepY;
+
+      out.push({
+        tx: clamp(tx, margin, width - margin),
+        ty: clamp(ty, margin, height - margin)
+      });
+    }
+  }
+
+  return out;
+}
+
+function buildTargetMap(nodes: BubbleNode[], width: number, height: number, margin: number) {
+  const targets = generateTargets(nodes.length, width, height, margin);
+
+  const cx = width / 2;
+  const cy = height / 2;
+
+  const sortedTargets = targets
+    .map((t) => ({
+      ...t,
+      d2: (t.tx - cx) * (t.tx - cx) + (t.ty - cy) * (t.ty - cy)
+    }))
+    .sort((a, b) => a.d2 - b.d2);
+
+  const sortedNodes = [...nodes].sort((a, b) => (b.score === a.score ? a.id.localeCompare(b.id) : b.score - a.score));
+
+  const map = new Map<string, Target>();
+  for (let i = 0; i < sortedNodes.length; i++) {
+    const n = sortedNodes[i];
+    const t = sortedTargets[i];
+    if (n && t) {
+      map.set(n.id, { tx: t.tx, ty: t.ty });
+    }
+  }
+
+  return map;
 }
 
 function formatMarketCap(n: number) {
@@ -264,11 +323,24 @@ export function BubbleMap() {
 
     const margin = maxR + 24;
 
+    const targetMap = buildTargetMap(filteredNodes, width, height, margin);
+
+    const mcValues = filteredNodes.map((n) => n.marketCap).filter((v): v is number => typeof v === "number" && v > 0);
+    const hasMarketCap = mcValues.length >= Math.ceil(filteredNodes.length * 0.6);
+    const minMarketCap = mcValues.length ? Math.min(...mcValues) : 0;
+    const maxMarketCap = mcValues.length ? Math.max(...mcValues) : 0;
+
     const prev = new Map(nodesRef.current.map((n) => [n.id, n]));
     const next: SimNode[] = filteredNodes.map((n) => {
       const existing = prev.get(n.id);
-      const r = calcRadius(n.score, minR, maxR);
-      const { tx, ty } = pickTarget(n.tokenAddress, width, height, margin);
+
+      const r = hasMarketCap
+        ? calcRadiusFromMarketCap(n.marketCap ?? minMarketCap, minMarketCap, maxMarketCap, minR, maxR)
+        : calcRadiusFallback(n.score, minR, maxR);
+
+      const target = targetMap.get(n.id);
+      const tx = target?.tx ?? width / 2;
+      const ty = target?.ty ?? height / 2;
 
       if (existing) {
         existing.rank = n.rank;
@@ -383,7 +455,8 @@ export function BubbleMap() {
           ctx.restore();
         }
 
-        const nameTextRaw = n.name || n.label;
+        const displayName = n.name || n.symbol || n.label;
+        const nameTextRaw = displayName.length > 14 && n.symbol ? n.symbol : displayName;
         const nameFontSize = Math.round(Math.max(12, Math.min(20, n.r / 3)));
         const nameTextY = n.y + n.r * 0.05;
 
@@ -401,7 +474,7 @@ export function BubbleMap() {
         ctx.fillText(nameText, n.x, nameTextY);
 
         const mc = typeof n.marketCap === "number" ? n.marketCap : 0;
-        const mcText = mc > 0 ? `$${formatMarketCap(mc)}` : "--";
+        const mcText = mc > 0 ? `$${formatMarketCap(mc)}` : "—";
         const mcFontSize = Math.round(Math.max(10, Math.min(16, n.r / 4)));
         const mcY = n.y + n.r * 0.35;
 
@@ -479,7 +552,7 @@ export function BubbleMap() {
       <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
         <div>
           <div className="text-sm text-[color:var(--color-muted)]">
-            Dexscreener boosts
+            Dexscreener → Fastify 封装
             {updatedAt ? ` · 更新时间：${new Date(updatedAt).toLocaleString()}` : null}
             {stale ? " · 缓存兜底" : null}
             {` · 当前数量：${filteredNodes.length}`}

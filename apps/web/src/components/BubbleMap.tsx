@@ -332,25 +332,37 @@ export function BubbleMap() {
       cache.set(n.iconUrl, img);
     }
 
-    const minR = 18;
-    const maxR = 70;
-
-    const margin = maxR + 24;
-
-    const targetMap = buildTargetMap(filteredNodes, width, height, margin);
+    const baseMinR = 18;
+    const baseMaxR = 70;
 
     const mcValues = filteredNodes.map((n) => n.marketCap).filter((v): v is number => typeof v === "number" && v > 0);
     const hasMarketCap = mcValues.length >= Math.ceil(filteredNodes.length * 0.6);
     const minMarketCap = mcValues.length ? Math.min(...mcValues) : 0;
     const maxMarketCap = mcValues.length ? Math.max(...mcValues) : 0;
 
+    const baseRadii = filteredNodes.map((n) => {
+      return hasMarketCap
+        ? calcRadiusFromMarketCap(n.marketCap ?? minMarketCap, minMarketCap, maxMarketCap, baseMinR, baseMaxR)
+        : calcRadiusFallback(n.score, baseMinR, baseMaxR);
+    });
+
+    const sumArea = baseRadii.reduce((acc, r) => acc + Math.PI * r * r, 0);
+    const canvasArea = width * height;
+
+    const targetCoverage = 0.28;
+    const scale = sumArea > 0 ? Math.sqrt((canvasArea * targetCoverage) / sumArea) : 1;
+    const radiusScale = clamp(scale, 0.85, 1.9);
+
+    const maxR = baseMaxR * radiusScale;
+    const margin = maxR + 24;
+
+    const targetMap = buildTargetMap(filteredNodes, width, height, margin);
+
     const prev = new Map(nodesRef.current.map((n) => [n.id, n]));
-    const next: SimNode[] = filteredNodes.map((n) => {
+    const next: SimNode[] = filteredNodes.map((n, idx) => {
       const existing = prev.get(n.id);
 
-      const r = hasMarketCap
-        ? calcRadiusFromMarketCap(n.marketCap ?? minMarketCap, minMarketCap, maxMarketCap, minR, maxR)
-        : calcRadiusFallback(n.score, minR, maxR);
+      const r = baseRadii[idx]! * radiusScale;
 
       const target = targetMap.get(n.id);
       const tx = target?.tx ?? width / 2;

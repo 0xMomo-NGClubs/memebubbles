@@ -244,6 +244,13 @@ export function BubbleMap() {
   const simRef = useRef<ReturnType<typeof forceSimulation<SimNode>> | null>(null);
   const nodesRef = useRef<SimNode[]>([]);
   const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const viewRef = useRef<{ scale: number; cx: number; cy: number; width: number; height: number }>({
+    scale: 1,
+    cx: 0,
+    cy: 0,
+    width: 0,
+    height: 0
+  });
   const hoveredIdRef = useRef<string | null>(null);
   const [hovered, setHovered] = useState<SimNode | null>(null);
 
@@ -434,6 +441,33 @@ export function BubbleMap() {
       ctx.fillStyle = bg;
       ctx.fillRect(0, 0, width, height);
 
+      let minX = Number.POSITIVE_INFINITY;
+      let minY = Number.POSITIVE_INFINITY;
+      let maxX = Number.NEGATIVE_INFINITY;
+      let maxY = Number.NEGATIVE_INFINITY;
+
+      for (const n of next) {
+        minX = Math.min(minX, n.x - n.r);
+        minY = Math.min(minY, n.y - n.r);
+        maxX = Math.max(maxX, n.x + n.r);
+        maxY = Math.max(maxY, n.y + n.r);
+      }
+
+      const contentW = Math.max(1, maxX - minX);
+      const contentH = Math.max(1, maxY - minY);
+      const pad = 24;
+      const fitScale = Math.min(width / (contentW + pad * 2), height / (contentH + pad * 2));
+      const viewScale = clamp(fitScale, 1, 1.65);
+      const cx = (minX + maxX) / 2;
+      const cy = (minY + maxY) / 2;
+
+      viewRef.current = { scale: viewScale, cx, cy, width, height };
+
+      ctx.save();
+      ctx.translate(width / 2, height / 2);
+      ctx.scale(viewScale, viewScale);
+      ctx.translate(-cx, -cy);
+
       const hoveredId = hoveredIdRef.current;
 
       for (const n of next) {
@@ -511,6 +545,7 @@ export function BubbleMap() {
         ctx.restore();
       }
 
+      ctx.restore();
       rafId = window.requestAnimationFrame(draw);
     }
 
@@ -530,12 +565,22 @@ export function BubbleMap() {
       const x = ev.clientX - rect.left;
       const y = ev.clientY - rect.top;
 
+      const view = viewRef.current;
+      const scale = view.scale || 1;
+      const cx = view.cx;
+      const cy = view.cy;
+      const w = view.width || rect.width;
+      const h = view.height || rect.height;
+
+      const sx = (x - w / 2) / scale + cx;
+      const sy = (y - h / 2) / scale + cy;
+
       const nodes = nodesRef.current;
       let best: SimNode | null = null;
 
       for (const n of nodes) {
-        const dx = x - n.x;
-        const dy = y - n.y;
+        const dx = sx - n.x;
+        const dy = sy - n.y;
         if (dx * dx + dy * dy <= n.r * n.r) {
           best = n;
           break;

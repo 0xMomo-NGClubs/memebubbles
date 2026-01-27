@@ -1,0 +1,20 @@
+{
+  "name": "@memebubbles/shared",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "mkdir -p dist && node -e \"console.log('shared 无需构建')\"", 
+    "typecheck": "tsc --noEmit",
+    "lint": "node -e \"console.log('lint 未配置，跳过')\""
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}

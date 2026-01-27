@@ -1,0 +1,31 @@
+{
+  "name": "@memebubbles/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsup src/index.ts --format esm --target es2022 --platform node --out-dir dist --sourcemap",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "node -e \"console.log('lint 未配置，跳过')\"", 
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.2",
+    "@fastify/rate-limit": "^10.3.0",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.2.1",
+    "zod": "^3.24.1",
+    "@memebubbles/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.3",
+    "tsx": "^4.19.2",
+    "tsup": "^8.3.5",
+    "vitest": "^2.1.8"
+  }
+}

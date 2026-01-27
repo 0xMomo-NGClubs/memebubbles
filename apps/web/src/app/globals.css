@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+:root {
+  --window-gap: 15px;
+  --color-bg: #222;
+  --color-fg: #fff;
+  --color-muted: rgba(255, 255, 255, 0.65);
+  --color-panel: rgba(0, 0, 0, 0.35);
+  --color-panel-border: rgba(255, 255, 255, 0.12);
+}
+
+body {
+  padding: 0;
+  margin: 0;
+  font: 20px Verdana, Arial, sans-serif;
+  color: var(--color-fg);
+  background-color: var(--color-bg);
+  -webkit-tap-highlight-color: transparent;
+  overflow: hidden;
+}

@@ -24,6 +24,8 @@ export type BubbleNode = {
   label: string;
   symbol?: string;
   name?: string;
+  marketCap?: number;
+  pairAddress?: string;
   score: number;
   url: string;
   description?: string;

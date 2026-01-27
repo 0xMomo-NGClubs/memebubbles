@@ -10,6 +10,8 @@ type SimNode = BubbleNode & {
   vx: number;
   vy: number;
   r: number;
+  tx: number;
+  ty: number;
 };
 
 function clamp(n: number, min: number, max: number) {
@@ -52,6 +54,50 @@ function hashToInt(s: string) {
     h = (h * 31 + s.charCodeAt(i)) | 0;
   }
   return h >>> 0;
+}
+
+function pickTarget(tokenAddress: string, width: number, height: number, margin: number) {
+  const h1 = hashToInt(tokenAddress);
+  const h2 = hashToInt(`y:${tokenAddress}`);
+
+  const w = Math.max(1, width - margin * 2);
+  const h = Math.max(1, height - margin * 2);
+
+  const tx = margin + ((h1 % 10_000) / 10_000) * w;
+  const ty = margin + ((h2 % 10_000) / 10_000) * h;
+
+  return { tx, ty };
+}
+
+function formatMarketCap(n: number) {
+  const abs = Math.abs(n);
+
+  if (abs >= 1_000_000) {
+    const v = n / 1_000_000;
+    const digits = Math.abs(v) < 10 ? 2 : Math.abs(v) < 100 ? 1 : 0;
+    return `${v.toFixed(digits)}M`;
+  }
+
+  if (abs >= 1_000) {
+    const v = n / 1_000;
+    const digits = Math.abs(v) < 10 ? 2 : Math.abs(v) < 100 ? 1 : 0;
+    return `${v.toFixed(digits)}K`;
+  }
+
+  return `${Math.round(n)}`;
+}
+
+function fitText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number) {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+
+  const ellipsis = "…";
+  let s = text;
+
+  while (s.length > 1 && ctx.measureText(s + ellipsis).width > maxWidth) {
+    s = s.slice(0, -1);
+  }
+
+  return s.length <= 1 ? ellipsis : s + ellipsis;
 }
 
 function hslToRgb(h: number, s: number, l: number) {
@@ -179,7 +225,6 @@ export function BubbleMap() {
 
       const sim = simRef.current;
       if (sim) {
-        sim.force("center", forceCenter(width / 2, height / 2));
         sim.alpha(0.6).restart();
       }
     };
@@ -217,15 +262,23 @@ export function BubbleMap() {
     const minR = 18;
     const maxR = 70;
 
+    const margin = maxR + 24;
+
     const prev = new Map(nodesRef.current.map((n) => [n.id, n]));
     const next: SimNode[] = filteredNodes.map((n) => {
       const existing = prev.get(n.id);
       const r = calcRadius(n.score, minR, maxR);
+      const { tx, ty } = pickTarget(n.tokenAddress, width, height, margin);
+
       if (existing) {
         existing.rank = n.rank;
         existing.chainId = n.chainId;
         existing.tokenAddress = n.tokenAddress;
         existing.label = n.label;
+        existing.symbol = n.symbol;
+        existing.name = n.name;
+        existing.marketCap = n.marketCap;
+        existing.pairAddress = n.pairAddress;
         existing.score = n.score;
         existing.url = n.url;
         existing.description = n.description;
@@ -233,16 +286,20 @@ export function BubbleMap() {
         existing.iconUrl = n.iconUrl;
         existing.links = n.links;
         existing.r = r;
+        existing.tx = tx;
+        existing.ty = ty;
         return existing;
       }
 
       return {
         ...n,
-        x: width / 2 + (Math.random() - 0.5) * 30,
-        y: height / 2 + (Math.random() - 0.5) * 30,
+        x: tx + (Math.random() - 0.5) * 20,
+        y: ty + (Math.random() - 0.5) * 20,
         vx: 0,
         vy: 0,
-        r
+        r,
+        tx,
+        ty
       };
     });
 
@@ -252,13 +309,16 @@ export function BubbleMap() {
     simRef.current = sim;
 
     sim.nodes(next);
+
+    sim.velocityDecay(0.22);
+
     sim
-      .force("charge", forceManyBody().strength(-12))
-      .force("x", forceX(width / 2).strength(0.05))
-      .force("y", forceY(height / 2).strength(0.05))
+      .force("charge", forceManyBody().strength(-18))
+      .force("x", forceX<SimNode>((d) => d.tx).strength(0.16))
+      .force("y", forceY<SimNode>((d) => d.ty).strength(0.16))
       .force("collide", forceCollide<SimNode>().radius((d) => d.r + 2).iterations(2))
-      .force("center", forceCenter(width / 2, height / 2))
-      .alpha(0.8)
+      .force("center", forceCenter(width / 2, height / 2).strength(0.02))
+      .alpha(0.9)
       .restart();
 
     let rafId = 0;
@@ -310,37 +370,44 @@ export function BubbleMap() {
         const iconUrl = n.iconUrl;
         const img = iconUrl ? cache.get(iconUrl) : undefined;
 
-        if (img && img.complete && img.naturalWidth > 0 && n.r >= 26) {
-          const sizePx = n.r * 1.05;
+        const iconCenterY = n.y - n.r * 0.32;
+        const iconRadius = n.r * 0.34;
+
+        if (img && img.complete && img.naturalWidth > 0) {
+          const sizePx = iconRadius * 2;
           ctx.save();
           ctx.beginPath();
-          ctx.arc(n.x, n.y, n.r * 0.55, 0, Math.PI * 2);
+          ctx.arc(n.x, iconCenterY, iconRadius, 0, Math.PI * 2);
           ctx.clip();
-          ctx.drawImage(img, n.x - sizePx / 2, n.y - sizePx / 2, sizePx, sizePx);
+          ctx.drawImage(img, n.x - sizePx / 2, iconCenterY - sizePx / 2, sizePx, sizePx);
           ctx.restore();
         }
 
-        if (n.r >= 22) {
-          const text = n.symbol || n.label;
-          const fontSize = Math.round(Math.max(12, Math.min(18, n.r / 3)));
+        const nameTextRaw = n.name || n.label;
+        const nameFontSize = Math.round(Math.max(12, Math.min(20, n.r / 3)));
+        const nameTextY = n.y + n.r * 0.05;
 
-          ctx.font = `700 ${fontSize}px Verdana, Arial, sans-serif`;
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
 
-          ctx.lineWidth = Math.max(2, Math.round(n.r / 18));
-          ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
-          ctx.strokeText(text, n.x, n.y);
+        ctx.font = `700 ${nameFontSize}px Verdana, Arial, sans-serif`;
+        const nameText = fitText(ctx, nameTextRaw, n.r * 1.55);
 
-          ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
-          ctx.fillText(text, n.x, n.y);
+        ctx.lineWidth = Math.max(2, Math.round(n.r / 18));
+        ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
+        ctx.strokeText(nameText, n.x, nameTextY);
 
-          if (n.name && n.r >= 34) {
-            ctx.font = `400 ${Math.max(10, Math.round(fontSize * 0.72))}px Verdana, Arial, sans-serif`;
-            ctx.fillStyle = "rgba(255, 255, 255, 0.75)";
-            ctx.fillText(n.name, n.x, n.y + fontSize * 0.9);
-          }
-        }
+        ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
+        ctx.fillText(nameText, n.x, nameTextY);
+
+        const mc = typeof n.marketCap === "number" ? n.marketCap : 0;
+        const mcText = mc > 0 ? `$${formatMarketCap(mc)}` : "--";
+        const mcFontSize = Math.round(Math.max(10, Math.min(16, n.r / 4)));
+        const mcY = n.y + n.r * 0.35;
+
+        ctx.font = `600 ${mcFontSize}px Verdana, Arial, sans-serif`;
+        ctx.fillStyle = "rgba(255, 255, 255, 0.78)";
+        ctx.fillText(mcText, n.x, mcY);
 
         ctx.restore();
       }
@@ -444,8 +511,8 @@ export function BubbleMap() {
             <div className="mt-1 break-all text-xs text-[color:var(--color-muted)]">{hovered.name ?? hovered.tokenAddress}</div>
             <div className="mt-1 break-all text-[11px] text-[color:var(--color-muted)]">{hovered.tokenAddress}</div>
             <div className="mt-2 flex items-center justify-between text-xs">
-              <div className="text-[color:var(--color-muted)]">Boost 总量</div>
-              <div className="font-semibold">{hovered.score}</div>
+              <div className="text-[color:var(--color-muted)]">市值</div>
+              <div className="font-semibold">{typeof hovered.marketCap === "number" ? `$${formatMarketCap(hovered.marketCap)}` : "--"}</div>
             </div>
             {hovered.description ? (
               <div className="mt-2 line-clamp-3 text-xs text-[color:var(--color-muted)]">{hovered.description}</div>

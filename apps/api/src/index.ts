@@ -12,6 +12,7 @@ if (process.env.NODE_ENV !== "production") {
 
 const DEXSCREENER_TOP_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1" as const;
 const DEXSCREENER_LATEST_TOKENS_BASE_URL = "https://api.dexscreener.com/latest/dex/tokens" as const;
+const DEXSCREENER_LATEST_PAIRS_BASE_URL = "https://api.dexscreener.com/latest/dex/pairs" as const;
 
 const envSchema = z.object({
   PORT: z.coerce.number().int().positive().optional(),
@@ -31,6 +32,8 @@ type TokenMeta = {
   symbol?: string;
   imageUrl?: string;
   headerImageUrl?: string;
+  marketCap?: number;
+  pairAddress?: string;
 };
 
 function mapBoostToBubbleNode(boost: DexscreenerTopBoost, rank: number, meta: TokenMeta | undefined): BubbleNode {
@@ -50,9 +53,11 @@ function mapBoostToBubbleNode(boost: DexscreenerTopBoost, rank: number, meta: To
     rank,
     chainId: boost.chainId,
     tokenAddress: boost.tokenAddress,
-    label: symbol || name || shortAddress(boost.tokenAddress),
+    label: name || symbol || shortAddress(boost.tokenAddress),
     symbol,
     name,
+    marketCap: meta?.marketCap,
+    pairAddress: meta?.pairAddress,
     score: boost.totalAmount,
     url: boost.url,
     description: boost.description,
@@ -237,6 +242,8 @@ async function fetchTokenMetaMap(tokenAddresses: string[]): Promise<Map<string, 
   const schema = z.object({
     pairs: z.array(
       z.object({
+        chainId: z.string(),
+        pairAddress: z.string(),
         baseToken: z.object({
           address: z.string(),
           name: z.string().optional(),
@@ -248,6 +255,8 @@ async function fetchTokenMetaMap(tokenAddresses: string[]): Promise<Map<string, 
             header: z.string().url().optional()
           })
           .optional(),
+        marketCap: z.number().optional(),
+        fdv: z.number().optional(),
         liquidity: z
           .object({
             usd: z.number().optional()
@@ -276,7 +285,9 @@ async function fetchTokenMetaMap(tokenAddresses: string[]): Promise<Map<string, 
           name: p.baseToken.name,
           symbol: p.baseToken.symbol,
           imageUrl: p.info?.imageUrl,
-          headerImageUrl: p.info?.header
+          headerImageUrl: p.info?.header,
+          marketCap: p.marketCap ?? p.fdv,
+          pairAddress: p.pairAddress
         };
 
         const existing = bestByAddr.get(addr);
@@ -302,17 +313,139 @@ async function fetchTokenMetaMap(tokenAddresses: string[]): Promise<Map<string, 
   return new Map();
 }
 
+function parsePairAddressFromUrl(url: string, chainId: string) {
+  try {
+    const u = new URL(url);
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts.length < 2) return undefined;
+    const [chain, pairAddress] = parts;
+    if (!chain || !pairAddress) return undefined;
+    if (chain.toLowerCase() !== chainId.toLowerCase()) return undefined;
+    return pairAddress;
+  } catch {
+    return undefined;
+  }
+}
+
+type PairKey = { chainId: string; pairAddress: string };
+
+function pairKeyToString(p: PairKey) {
+  return `${p.chainId.toLowerCase()}:${p.pairAddress.toLowerCase()}`;
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>) {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  const workers = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    for (;;) {
+      const i = nextIndex;
+      nextIndex++;
+      const item = items[i];
+      if (item === undefined) return;
+      results[i] = await fn(item);
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
+
+async function fetchPairsMetaMap(pairs: PairKey[]): Promise<Map<string, TokenMeta>> {
+  const schema = z.object({
+    pairs: z.array(
+      z.object({
+        chainId: z.string(),
+        pairAddress: z.string(),
+        baseToken: z.object({
+          address: z.string(),
+          name: z.string().optional(),
+          symbol: z.string().optional()
+        }),
+        info: z
+          .object({
+            imageUrl: z.string().url().optional(),
+            header: z.string().url().optional()
+          })
+          .optional(),
+        marketCap: z.number().optional(),
+        fdv: z.number().optional()
+      })
+    )
+  });
+
+  const timeoutMs = Number(process.env.DEXSCREENER_TIMEOUT_MS ?? 8000);
+
+  const uniq = new Map<string, PairKey>();
+  for (const p of pairs) {
+    uniq.set(pairKeyToString(p), p);
+  }
+
+  const uniqPairs = Array.from(uniq.values());
+
+  const metas = await mapLimit(uniqPairs, 6, async (p) => {
+    const url = `${DEXSCREENER_LATEST_PAIRS_BASE_URL}/${p.chainId}/${p.pairAddress}`;
+    const json = await httpsGetJson(url, timeoutMs);
+    const parsed = schema.parse(json);
+    const first = parsed.pairs[0];
+    if (!first) return null;
+
+    const addr = first.baseToken.address.toLowerCase();
+    const meta: TokenMeta = {
+      name: first.baseToken.name,
+      symbol: first.baseToken.symbol,
+      imageUrl: first.info?.imageUrl,
+      headerImageUrl: first.info?.header,
+      marketCap: first.marketCap ?? first.fdv,
+      pairAddress: first.pairAddress
+    };
+
+    return { addr, meta };
+  }).catch(() => []);
+
+  const out = new Map<string, TokenMeta>();
+  for (const m of metas) {
+    if (!m) continue;
+    out.set(m.addr, m.meta);
+  }
+
+  return out;
+}
+
 async function refreshTopBoostBubbles(limit: number): Promise<CacheState> {
   cache.lastAttemptedAtMs = Date.now();
 
   const boosts = await fetchTopBoostsFromDexscreener();
 
-  const addrs = boosts.slice(0, limit).map((b) => b.tokenAddress);
-  const metaMap = await fetchTokenMetaMap(addrs).catch(() => new Map());
+  const top = boosts.slice(0, limit);
 
-  const nodes = boosts
-    .slice(0, limit)
-    .map((b, idx) => mapBoostToBubbleNode(b, idx + 1, metaMap.get(b.tokenAddress.toLowerCase())));
+  const addrs = top.map((b) => b.tokenAddress);
+  const tokenMetaMap = await fetchTokenMetaMap(addrs).catch(() => new Map());
+
+  const pairsToFetch: PairKey[] = [];
+
+  for (const b of top) {
+    const addr = b.tokenAddress.toLowerCase();
+
+    const parsedPair = parsePairAddressFromUrl(b.url, b.chainId);
+    if (parsedPair) {
+      const existing = tokenMetaMap.get(addr);
+      tokenMetaMap.set(addr, { ...(existing ?? {}), pairAddress: parsedPair });
+    }
+
+    const pairAddress = tokenMetaMap.get(addr)?.pairAddress;
+    if (pairAddress) {
+      pairsToFetch.push({ chainId: b.chainId, pairAddress });
+    }
+  }
+
+  const pairMetaMap = await fetchPairsMetaMap(pairsToFetch).catch(() => new Map());
+
+  const nodes = top.map((b, idx) => {
+    const addr = b.tokenAddress.toLowerCase();
+    const meta = pairMetaMap.get(addr) ?? tokenMetaMap.get(addr);
+    return mapBoostToBubbleNode(b, idx + 1, meta);
+  });
 
   const state: CacheState = { updatedAtMs: Date.now(), data: nodes };
   cache.latest = state;

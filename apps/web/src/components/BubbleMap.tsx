@@ -69,7 +69,13 @@ function hashToInt(s: string) {
   return h >>> 0;
 }
 
-type Target = { tx: number; ty: number };
+type Target = { tx: number; ty: number; noise: number };
+
+function rand01(seed: number) {
+  let x = seed >>> 0;
+  x = (x * 1664525 + 1013904223) >>> 0;
+  return x / 4294967296;
+}
 
 function generateTargets(count: number, width: number, height: number, margin: number): Target[] {
   const w = Math.max(1, width - margin * 2);
@@ -87,13 +93,19 @@ function generateTargets(count: number, width: number, height: number, margin: n
     for (let col = 0; col < cols; col++) {
       if (out.length >= count) return out;
 
+      const seed = (((row + 1) * 73856093) ^ ((col + 1) * 19349663) ^ (width * 83492791) ^ (height * 2654435761)) >>> 0;
+      const jx = (rand01(seed) - 0.5) * stepX * 0.7;
+      const jy = (rand01(seed ^ 0x9e3779b9) - 0.5) * stepY * 0.7;
+      const noise = rand01(seed ^ 0x85ebca6b);
+
       const offsetX = (row % 2) * (stepX * 0.5);
-      const tx = margin + (col + 0.5) * stepX + offsetX;
-      const ty = margin + (row + 0.5) * stepY;
+      const tx = margin + (col + 0.5) * stepX + offsetX + jx;
+      const ty = margin + (row + 0.5) * stepY + jy;
 
       out.push({
         tx: clamp(tx, margin, width - margin),
-        ty: clamp(ty, margin, height - margin)
+        ty: clamp(ty, margin, height - margin),
+        noise
       });
     }
   }
@@ -106,17 +118,19 @@ function buildTargetMap(nodes: BubbleNode[], width: number, height: number, marg
 
   const cx = width / 2;
   const cy = height / 2;
+  const scale = Math.max(width, height);
 
   const sortedTargets = targets
-    .map((t) => ({
-      ...t,
-      d2: (t.tx - cx) * (t.tx - cx) + (t.ty - cy) * (t.ty - cy)
-    }))
-    .sort((a, b) => a.d2 - b.d2);
+    .map((t) => {
+      const d2 = (t.tx - cx) * (t.tx - cx) + (t.ty - cy) * (t.ty - cy);
+      const jitter = (t.noise - 0.5) * (scale * scale) * 0.02;
+      return { ...t, key: d2 + jitter };
+    })
+    .sort((a, b) => a.key - b.key);
 
   const sortedNodes = [...nodes].sort((a, b) => (b.score === a.score ? a.id.localeCompare(b.id) : b.score - a.score));
 
-  const map = new Map<string, Target>();
+  const map = new Map<string, { tx: number; ty: number }>();
   for (let i = 0; i < sortedNodes.length; i++) {
     const n = sortedNodes[i];
     const t = sortedTargets[i];

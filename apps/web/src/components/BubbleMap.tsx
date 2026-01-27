@@ -22,12 +22,8 @@ function calcRadius(score: number, minR: number, maxR: number) {
   return minR + (maxR - minR) * t;
 }
 
-function getApiBaseUrl() {
-  return process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3001";
-}
-
 async function fetchTopBoostBubbles(signal: AbortSignal): Promise<TopBoostBubblesResponse> {
-  const url = `${getApiBaseUrl()}/api/v1/bubbles/top-boosts?limit=30`;
+  const url = `/api/v1/bubbles/top-boosts?limit=30`;
   const res = await fetch(url, { signal, cache: "no-store" });
   if (!res.ok) {
     throw new Error(`请求失败: ${res.status}`);

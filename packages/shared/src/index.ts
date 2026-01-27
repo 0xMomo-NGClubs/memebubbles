@@ -22,6 +22,8 @@ export type BubbleNode = {
   chainId: string;
   tokenAddress: string;
   label: string;
+  symbol?: string;
+  name?: string;
   score: number;
   url: string;
   description?: string;

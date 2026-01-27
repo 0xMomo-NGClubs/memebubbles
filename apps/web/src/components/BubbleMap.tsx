@@ -46,16 +46,61 @@ function scaleRgb(c: Rgba, factor: number): Rgba {
   };
 }
 
-function pickColor(chainId: string, stale: boolean): Rgba {
-  const base = chainId.toLowerCase();
+function hashToInt(s: string) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 31 + s.charCodeAt(i)) | 0;
+  }
+  return h >>> 0;
+}
+
+function hslToRgb(h: number, s: number, l: number) {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const hp = h / 60;
+  const x = c * (1 - Math.abs((hp % 2) - 1));
+
+  let r1 = 0;
+  let g1 = 0;
+  let b1 = 0;
+
+  if (hp >= 0 && hp < 1) {
+    r1 = c;
+    g1 = x;
+  } else if (hp >= 1 && hp < 2) {
+    r1 = x;
+    g1 = c;
+  } else if (hp >= 2 && hp < 3) {
+    g1 = c;
+    b1 = x;
+  } else if (hp >= 3 && hp < 4) {
+    g1 = x;
+    b1 = c;
+  } else if (hp >= 4 && hp < 5) {
+    r1 = x;
+    b1 = c;
+  } else {
+    r1 = c;
+    b1 = x;
+  }
+
+  const m = l - c / 2;
+  return {
+    r: Math.round((r1 + m) * 255),
+    g: Math.round((g1 + m) * 255),
+    b: Math.round((b1 + m) * 255)
+  };
+}
+
+function pickColor(chainId: string, tokenAddress: string, stale: boolean): Rgba {
   const a = stale ? 0.5 : 0.92;
+  const base = chainId.toLowerCase();
 
-  if (base === "solana") return { r: 153, g: 69, b: 255, a };
-  if (base === "ethereum") return { r: 98, g: 126, b: 234, a };
-  if (base === "base") return { r: 0, g: 82, b: 255, a };
-  if (base === "bsc") return { r: 243, g: 186, b: 47, a };
+  const baseHue = base === "solana" ? 270 : base === "ethereum" ? 220 : base === "base" ? 210 : base === "bsc" ? 48 : 0;
+  const jitter = (hashToInt(tokenAddress) % 50) - 25;
+  const hue = (baseHue + jitter + 360) % 360;
 
-  return { r: 63, g: 63, b: 70, a };
+  const rgb = hslToRgb(hue, 0.78, 0.55);
+  return { ...rgb, a };
 }
 
 export function BubbleMap() {
@@ -79,6 +124,7 @@ export function BubbleMap() {
 
   const simRef = useRef<ReturnType<typeof forceSimulation<SimNode>> | null>(null);
   const nodesRef = useRef<SimNode[]>([]);
+  const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const hoveredIdRef = useRef<string | null>(null);
   const [hovered, setHovered] = useState<SimNode | null>(null);
 
@@ -157,6 +203,17 @@ export function BubbleMap() {
 
     if (width < 10 || height < 10) return;
 
+    const cache = imageCacheRef.current;
+    for (const n of filteredNodes) {
+      if (!n.iconUrl) continue;
+      if (cache.has(n.iconUrl)) continue;
+
+      const img = new Image();
+      img.decoding = "async";
+      img.src = n.iconUrl;
+      cache.set(n.iconUrl, img);
+    }
+
     const minR = 18;
     const maxR = 70;
 
@@ -223,7 +280,7 @@ export function BubbleMap() {
 
       for (const n of next) {
         const isHover = hoveredId === n.id;
-        const base = pickColor(n.chainId, stale);
+        const base = pickColor(n.chainId, n.tokenAddress, stale);
 
         const light = rgba({ r: 255, g: 255, b: 255, a: stale ? 0.18 : 0.28 });
         const mid = rgba(base);
@@ -249,8 +306,22 @@ export function BubbleMap() {
         ctx.strokeStyle = isHover ? "rgba(255, 255, 255, 0.55)" : "rgba(255, 255, 255, 0.18)";
         ctx.stroke();
 
+        const cache = imageCacheRef.current;
+        const iconUrl = n.iconUrl;
+        const img = iconUrl ? cache.get(iconUrl) : undefined;
+
+        if (img && img.complete && img.naturalWidth > 0 && n.r >= 26) {
+          const sizePx = n.r * 1.05;
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, n.r * 0.55, 0, Math.PI * 2);
+          ctx.clip();
+          ctx.drawImage(img, n.x - sizePx / 2, n.y - sizePx / 2, sizePx, sizePx);
+          ctx.restore();
+        }
+
         if (n.r >= 22) {
-          const text = n.label;
+          const text = n.symbol || n.label;
           const fontSize = Math.round(Math.max(12, Math.min(18, n.r / 3)));
 
           ctx.font = `700 ${fontSize}px Verdana, Arial, sans-serif`;
@@ -263,6 +334,12 @@ export function BubbleMap() {
 
           ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
           ctx.fillText(text, n.x, n.y);
+
+          if (n.name && n.r >= 34) {
+            ctx.font = `400 ${Math.max(10, Math.round(fontSize * 0.72))}px Verdana, Arial, sans-serif`;
+            ctx.fillStyle = "rgba(255, 255, 255, 0.75)";
+            ctx.fillText(n.name, n.x, n.y + fontSize * 0.9);
+          }
         }
 
         ctx.restore();
@@ -361,10 +438,11 @@ export function BubbleMap() {
         {hovered ? (
           <div className="pointer-events-none absolute left-3 top-3 w-[340px] rounded-xl border border-[color:var(--color-panel-border)] bg-black/60 p-3 text-sm text-white shadow-lg backdrop-blur">
             <div className="flex items-center justify-between">
-              <div className="font-semibold">{hovered.label}</div>
+              <div className="font-semibold">{hovered.symbol ?? hovered.label}</div>
               <div className="text-xs text-[color:var(--color-muted)]">{hovered.chainId}</div>
             </div>
-            <div className="mt-1 break-all text-xs text-[color:var(--color-muted)]">{hovered.tokenAddress}</div>
+            <div className="mt-1 break-all text-xs text-[color:var(--color-muted)]">{hovered.name ?? hovered.tokenAddress}</div>
+            <div className="mt-1 break-all text-[11px] text-[color:var(--color-muted)]">{hovered.tokenAddress}</div>
             <div className="mt-2 flex items-center justify-between text-xs">
               <div className="text-[color:var(--color-muted)]">Boost 总量</div>
               <div className="font-semibold">{hovered.score}</div>

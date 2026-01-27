@@ -11,6 +11,7 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 const DEXSCREENER_TOP_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1" as const;
+const DEXSCREENER_LATEST_TOKENS_BASE_URL = "https://api.dexscreener.com/latest/dex/tokens" as const;
 
 const envSchema = z.object({
   PORT: z.coerce.number().int().positive().optional(),
@@ -25,7 +26,14 @@ function shortAddress(address: string) {
   return `${address.slice(0, 4)}…${address.slice(-4)}`;
 }
 
-function mapBoostToBubbleNode(boost: DexscreenerTopBoost, rank: number): BubbleNode {
+type TokenMeta = {
+  name?: string;
+  symbol?: string;
+  imageUrl?: string;
+  headerImageUrl?: string;
+};
+
+function mapBoostToBubbleNode(boost: DexscreenerTopBoost, rank: number, meta: TokenMeta | undefined): BubbleNode {
   const id = `${boost.chainId}:${boost.tokenAddress}`;
 
   const links = (boost.links ?? []).map((l) => {
@@ -34,17 +42,22 @@ function mapBoostToBubbleNode(boost: DexscreenerTopBoost, rank: number): BubbleN
     return { url: l.url, type, label };
   });
 
+  const symbol = meta?.symbol;
+  const name = meta?.name;
+
   return {
     id,
     rank,
     chainId: boost.chainId,
     tokenAddress: boost.tokenAddress,
-    label: shortAddress(boost.tokenAddress),
+    label: symbol || name || shortAddress(boost.tokenAddress),
+    symbol,
+    name,
     score: boost.totalAmount,
     url: boost.url,
     description: boost.description,
-    headerImageUrl: boost.header,
-    iconUrl: undefined,
+    headerImageUrl: meta?.headerImageUrl ?? boost.header,
+    iconUrl: meta?.imageUrl,
     links
   };
 }
@@ -218,11 +231,88 @@ async function fetchTopBoostsFromDexscreener(): Promise<DexscreenerTopBoost[]> {
   throw new Error("Dexscreener 请求失败：未知原因");
 }
 
+async function fetchTokenMetaMap(tokenAddresses: string[]): Promise<Map<string, TokenMeta>> {
+  if (tokenAddresses.length === 0) return new Map();
+
+  const schema = z.object({
+    pairs: z.array(
+      z.object({
+        baseToken: z.object({
+          address: z.string(),
+          name: z.string().optional(),
+          symbol: z.string().optional()
+        }),
+        info: z
+          .object({
+            imageUrl: z.string().url().optional(),
+            header: z.string().url().optional()
+          })
+          .optional(),
+        liquidity: z
+          .object({
+            usd: z.number().optional()
+          })
+          .optional()
+      })
+    )
+  });
+
+  const maxAttempts = 2;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const timeoutMs = Number(process.env.DEXSCREENER_TIMEOUT_MS ?? 8000);
+      const url = `${DEXSCREENER_LATEST_TOKENS_BASE_URL}/${tokenAddresses.join(",")}`;
+      const json = await httpsGetJson(url, timeoutMs);
+      const parsed = schema.parse(json);
+
+      const bestByAddr = new Map<string, { usd: number; meta: TokenMeta }>();
+
+      for (const p of parsed.pairs) {
+        const addr = p.baseToken.address.toLowerCase();
+        const usd = p.liquidity?.usd ?? 0;
+
+        const meta: TokenMeta = {
+          name: p.baseToken.name,
+          symbol: p.baseToken.symbol,
+          imageUrl: p.info?.imageUrl,
+          headerImageUrl: p.info?.header
+        };
+
+        const existing = bestByAddr.get(addr);
+        if (!existing || usd > existing.usd) {
+          bestByAddr.set(addr, { usd, meta });
+        }
+      }
+
+      const out = new Map<string, TokenMeta>();
+      for (const [addr, v] of bestByAddr) {
+        out.set(addr, v.meta);
+      }
+      return out;
+    } catch (err) {
+      if (attempt >= maxAttempts || !isRetryableNetworkError(err)) {
+        throw err;
+      }
+      const delayMs = 200 * Math.pow(2, attempt - 1);
+      await sleep(delayMs);
+    }
+  }
+
+  return new Map();
+}
+
 async function refreshTopBoostBubbles(limit: number): Promise<CacheState> {
   cache.lastAttemptedAtMs = Date.now();
 
   const boosts = await fetchTopBoostsFromDexscreener();
-  const nodes = boosts.slice(0, limit).map((b, idx) => mapBoostToBubbleNode(b, idx + 1));
+
+  const addrs = boosts.slice(0, limit).map((b) => b.tokenAddress);
+  const metaMap = await fetchTokenMetaMap(addrs).catch(() => new Map());
+
+  const nodes = boosts
+    .slice(0, limit)
+    .map((b, idx) => mapBoostToBubbleNode(b, idx + 1, metaMap.get(b.tokenAddress.toLowerCase())));
 
   const state: CacheState = { updatedAtMs: Date.now(), data: nodes };
   cache.latest = state;

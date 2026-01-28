@@ -2,7 +2,7 @@
 
 import { forceCenter, forceCollide, forceManyBody, forceSimulation, forceX, forceY } from "d3-force";
 import type { BubbleNode, RecentBoostBubblesResponse } from "@memebubbles/shared";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type SimNode = BubbleNode & {
   x: number;
@@ -248,20 +248,9 @@ export function BubbleMap() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  const [query, setQuery] = useState("");
   const [rawNodes, setRawNodes] = useState<BubbleNode[]>([]);
-  const [updatedAt, setUpdatedAt] = useState<string | null>(null);
   const [stale, setStale] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [size, setSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
-
-  const filteredNodes = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return rawNodes;
-    return rawNodes.filter((n) => {
-      return n.tokenAddress.toLowerCase().includes(q) || n.label.toLowerCase().includes(q);
-    });
-  }, [query, rawNodes]);
 
   const simRef = useRef<ReturnType<typeof forceSimulation<SimNode>> | null>(null);
   const nodesRef = useRef<SimNode[]>([]);
@@ -281,13 +270,11 @@ export function BubbleMap() {
 
     async function runOnce() {
       try {
-        setError(null);
         const data = await fetchRecentBoostBubbles(controller.signal);
         setRawNodes(data.data);
-        setUpdatedAt(data.updatedAt);
         setStale(data.stale);
       } catch (e) {
-        setError(e instanceof Error ? e.message : "未知错误");
+        return;
       }
     }
 
@@ -351,7 +338,7 @@ export function BubbleMap() {
     if (width < 10 || height < 10) return;
 
     const cache = imageCacheRef.current;
-    for (const n of filteredNodes) {
+    for (const n of rawNodes) {
       if (!n.iconUrl) continue;
       if (cache.has(n.iconUrl)) continue;
 
@@ -364,12 +351,12 @@ export function BubbleMap() {
     const baseMinR = 18;
     const baseMaxR = 70;
 
-    const mcValues = filteredNodes.map((n) => n.marketCap).filter((v): v is number => typeof v === "number" && v > 0);
-    const hasMarketCap = mcValues.length >= Math.ceil(filteredNodes.length * 0.6);
+    const mcValues = rawNodes.map((n) => n.marketCap).filter((v): v is number => typeof v === "number" && v > 0);
+    const hasMarketCap = mcValues.length >= Math.ceil(rawNodes.length * 0.6);
     const minMarketCap = mcValues.length ? Math.min(...mcValues) : 0;
     const maxMarketCap = mcValues.length ? Math.max(...mcValues) : 0;
 
-    const baseRadii = filteredNodes.map((n) => {
+    const baseRadii = rawNodes.map((n) => {
       return hasMarketCap
         ? calcRadiusFromMarketCap(n.marketCap ?? minMarketCap, minMarketCap, maxMarketCap, baseMinR, baseMaxR)
         : calcRadiusFallback(n.score, baseMinR, baseMaxR);
@@ -385,18 +372,18 @@ export function BubbleMap() {
     const maxR = baseMaxR * radiusScale;
     const margin = maxR + 24;
 
-    const targetMap = buildTargetMap(filteredNodes, width, height, margin);
+    const targetMap = buildTargetMap(rawNodes, width, height, margin);
 
     const nowMs = performance.now();
-    const enableLifecycle = query.trim().length === 0;
+    const enableLifecycle = true;
 
     const prev = new Map(nodesRef.current.map((n) => [n.id, n]));
-    const incomingIds = new Set(filteredNodes.map((n) => n.id));
+    const incomingIds = new Set(rawNodes.map((n) => n.id));
 
     const next: SimNode[] = [];
 
-    for (let idx = 0; idx < filteredNodes.length; idx++) {
-      const n = filteredNodes[idx]!;
+    for (let idx = 0; idx < rawNodes.length; idx++) {
+      const n = rawNodes[idx]!;
       const existing = prev.get(n.id);
 
       const r = baseRadii[idx]! * radiusScale;
@@ -700,7 +687,7 @@ export function BubbleMap() {
     return () => {
       window.cancelAnimationFrame(rafId);
     };
-  }, [filteredNodes, query, stale, size.height, size.width]);
+  }, [rawNodes, stale, size.height, size.width]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -766,51 +753,27 @@ export function BubbleMap() {
   }, []);
 
   return (
-    <div className="flex h-full w-full flex-col gap-3">
-      <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-        <div>
-          <div className="text-sm text-[color:var(--color-muted)]">
-            Dexscreener → Fastify 封装
-            {updatedAt ? ` · 更新时间：${new Date(updatedAt).toLocaleString()}` : null}
-            {stale ? " · 缓存兜底" : null}
-            {` · 当前数量：${filteredNodes.length}`}
-          </div>
-          {error ? <div className="text-sm text-red-400">请求失败：{error}</div> : null}
-        </div>
-        <div className="flex items-center gap-2">
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索地址"
-            className="h-10 w-full rounded-md border border-[color:var(--color-panel-border)] bg-[color:var(--color-panel)] px-3 text-sm text-white outline-none placeholder:text-[color:var(--color-muted)] focus:border-white/30 md:w-80"
-          />
-        </div>
-      </div>
+    <div
+      ref={containerRef}
+      className="bubble-chart relative h-full w-full overflow-hidden rounded-xl border border-[color:var(--color-panel-border)] bg-[color:var(--color-panel)]"
+    >
+      <canvas ref={canvasRef} className="absolute left-0 top-0" />
 
-      <div
-        ref={containerRef}
-        className="bubble-chart relative min-h-[520px] flex-1 overflow-hidden rounded-xl border border-[color:var(--color-panel-border)] bg-[color:var(--color-panel)]"
-      >
-        <canvas ref={canvasRef} className="absolute left-0 top-0" />
-
-        {hovered ? (
-          <div className="pointer-events-none absolute left-3 top-3 w-[340px] rounded-xl border border-[color:var(--color-panel-border)] bg-black/60 p-3 text-sm text-white shadow-lg backdrop-blur">
-            <div className="flex items-center justify-between">
-              <div className="font-semibold">{hovered.symbol ?? hovered.label}</div>
-              <div className="text-xs text-[color:var(--color-muted)]">{hovered.chainId}</div>
-            </div>
-            <div className="mt-1 break-all text-xs text-[color:var(--color-muted)]">{hovered.name ?? hovered.tokenAddress}</div>
-            <div className="mt-1 break-all text-[11px] text-[color:var(--color-muted)]">{hovered.tokenAddress}</div>
-            <div className="mt-2 flex items-center justify-between text-xs">
-              <div className="text-[color:var(--color-muted)]">市值</div>
-              <div className="font-semibold">{typeof hovered.marketCap === "number" ? `$${formatMarketCap(hovered.marketCap)}` : "--"}</div>
-            </div>
-            {hovered.description ? (
-              <div className="mt-2 line-clamp-3 text-xs text-[color:var(--color-muted)]">{hovered.description}</div>
-            ) : null}
+      {hovered ? (
+        <div className="pointer-events-none absolute left-3 top-3 w-[340px] rounded-xl border border-[color:var(--color-panel-border)] bg-black/60 p-3 text-sm text-white shadow-lg backdrop-blur">
+          <div className="flex items-center justify-between">
+            <div className="font-semibold">{hovered.symbol ?? hovered.label}</div>
+            <div className="text-xs text-[color:var(--color-muted)]">{hovered.chainId}</div>
           </div>
-        ) : null}
-      </div>
+          <div className="mt-1 break-all text-xs text-[color:var(--color-muted)]">{hovered.name ?? hovered.tokenAddress}</div>
+          <div className="mt-1 break-all text-[11px] text-[color:var(--color-muted)]">{hovered.tokenAddress}</div>
+          <div className="mt-2 flex items-center justify-between text-xs">
+            <div className="text-[color:var(--color-muted)]">市值</div>
+            <div className="font-semibold">{typeof hovered.marketCap === "number" ? `$${formatMarketCap(hovered.marketCap)}` : "--"}</div>
+          </div>
+          {hovered.description ? <div className="mt-2 line-clamp-3 text-xs text-[color:var(--color-muted)]">{hovered.description}</div> : null}
+        </div>
+      ) : null}
     </div>
   );
 }

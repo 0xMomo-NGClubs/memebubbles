@@ -1,7 +1,7 @@
 "use client";
 
 import { forceCenter, forceCollide, forceManyBody, forceSimulation, forceX, forceY } from "d3-force";
-import type { BubbleNode, TopBoostBubblesResponse } from "@memebubbles/shared";
+import type { BubbleNode, RecentBoostBubblesResponse } from "@memebubbles/shared";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 type SimNode = BubbleNode & {
@@ -10,12 +10,30 @@ type SimNode = BubbleNode & {
   vx: number;
   vy: number;
   r: number;
+  s: number;
+  phase: "stable" | "entering" | "leaving";
+  phaseStartAtMs: number;
   tx: number;
   ty: number;
 };
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
+}
+
+const ENTER_ANIM_MS = 420;
+const LEAVE_ANIM_MS = 380;
+
+function easeOutBack(t: number) {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+}
+
+function easeInBack(t: number) {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+  return c3 * t * t * t - c1 * t * t;
 }
 
 function calcRadiusFromMarketCap(marketCap: number, minMarketCap: number, maxMarketCap: number, minR: number, maxR: number) {
@@ -41,13 +59,13 @@ function calcRadiusFallback(score: number, minR: number, maxR: number) {
   return minR + (maxR - minR) * t;
 }
 
-async function fetchTopBoostBubbles(signal: AbortSignal): Promise<TopBoostBubblesResponse> {
-  const url = `/api/v1/bubbles/top-boosts?limit=30`;
+async function fetchRecentBoostBubbles(signal: AbortSignal): Promise<RecentBoostBubblesResponse> {
+  const url = `/api/v1/bubbles/recent?limit=100`;
   const res = await fetch(url, { signal, cache: "no-store" });
   if (!res.ok) {
     throw new Error(`请求失败: ${res.status}`);
   }
-  return (await res.json()) as TopBoostBubblesResponse;
+  return (await res.json()) as RecentBoostBubblesResponse;
 }
 
 type Rgba = { r: number; g: number; b: number; a: number };
@@ -264,7 +282,7 @@ export function BubbleMap() {
     async function runOnce() {
       try {
         setError(null);
-        const data = await fetchTopBoostBubbles(controller.signal);
+        const data = await fetchRecentBoostBubbles(controller.signal);
         setRawNodes(data.data);
         setUpdatedAt(data.updatedAt);
         setStale(data.stale);
@@ -369,8 +387,16 @@ export function BubbleMap() {
 
     const targetMap = buildTargetMap(filteredNodes, width, height, margin);
 
+    const nowMs = performance.now();
+    const enableLifecycle = query.trim().length === 0;
+
     const prev = new Map(nodesRef.current.map((n) => [n.id, n]));
-    const next: SimNode[] = filteredNodes.map((n, idx) => {
+    const incomingIds = new Set(filteredNodes.map((n) => n.id));
+
+    const next: SimNode[] = [];
+
+    for (let idx = 0; idx < filteredNodes.length; idx++) {
+      const n = filteredNodes[idx]!;
       const existing = prev.get(n.id);
 
       const r = baseRadii[idx]! * radiusScale;
@@ -397,20 +423,57 @@ export function BubbleMap() {
         existing.r = r;
         existing.tx = tx;
         existing.ty = ty;
-        return existing;
+
+        if (existing.phaseStartAtMs === undefined || existing.s === undefined || existing.phase === undefined) {
+          existing.phase = "stable";
+          existing.s = 1;
+          existing.phaseStartAtMs = nowMs;
+        }
+
+        if (!enableLifecycle) {
+          existing.phase = "stable";
+          existing.s = 1;
+          existing.phaseStartAtMs = nowMs;
+        } else if (existing.phase === "leaving") {
+          existing.phase = "entering";
+          existing.s = Math.min(existing.s, 0.2);
+          existing.phaseStartAtMs = nowMs;
+        }
+
+        next.push(existing);
+        continue;
       }
 
-      return {
+      const marginPx = 24;
+      const x0 = marginPx + Math.random() * Math.max(1, width - marginPx * 2);
+      const y0 = marginPx + Math.random() * Math.max(1, height - marginPx * 2);
+
+      next.push({
         ...n,
-        x: tx + (Math.random() - 0.5) * 20,
-        y: ty + (Math.random() - 0.5) * 20,
+        x: x0,
+        y: y0,
         vx: 0,
         vy: 0,
         r,
+        s: enableLifecycle ? 0.001 : 1,
+        phase: enableLifecycle ? "entering" : "stable",
+        phaseStartAtMs: nowMs,
         tx,
         ty
-      };
-    });
+      });
+    }
+
+    if (enableLifecycle) {
+      for (const old of nodesRef.current) {
+        if (incomingIds.has(old.id)) continue;
+        if (old.phase !== "leaving") {
+          old.phase = "leaving";
+          old.s = 1;
+          old.phaseStartAtMs = nowMs;
+        }
+        next.push(old);
+      }
+    }
 
     nodesRef.current = next;
 
@@ -447,7 +510,15 @@ export function BubbleMap() {
       .force("charge", forceManyBody().strength(-18))
       .force("x", forceX<SimNode>((d) => d.tx).strength(0.16))
       .force("y", forceY<SimNode>((d) => d.ty).strength(0.16))
-      .force("collide", forceCollide<SimNode>().radius((d) => d.r + 2).iterations(2))
+      .force(
+        "collide",
+        forceCollide<SimNode>()
+          .radius((d) => {
+            const physicalScale = d.phase === "leaving" ? d.s : 1;
+            return d.r * clamp(physicalScale, 0, 1) + 2;
+          })
+          .iterations(2)
+      )
       .force("center", forceCenter(width / 2, height / 2).strength(0.02))
       .force("wiggle", wiggleForce)
       .alphaTarget(0.02)
@@ -460,6 +531,49 @@ export function BubbleMap() {
       if (!canvas) return;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
+
+      const nowMs = performance.now();
+
+      const nodesBefore = nodesRef.current;
+      const toRemove = new Set<string>();
+
+      for (const n of nodesBefore) {
+        if (n.phase === "entering") {
+          const p = clamp((nowMs - n.phaseStartAtMs) / ENTER_ANIM_MS, 0, 1);
+          n.s = clamp(easeOutBack(p), 0, 1.15);
+          if (p >= 1) {
+            n.phase = "stable";
+            n.s = 1;
+          }
+          continue;
+        }
+
+        if (n.phase === "leaving") {
+          const p = clamp((nowMs - n.phaseStartAtMs) / LEAVE_ANIM_MS, 0, 1);
+          n.s = clamp(1 - easeInBack(p), 0, 1);
+          if (p >= 1 || n.s <= 0.01) {
+            toRemove.add(n.id);
+          }
+        } else {
+          n.s = 1;
+        }
+      }
+
+      if (toRemove.size > 0) {
+        nodesRef.current = nodesBefore.filter((n) => !toRemove.has(n.id));
+        const sim0 = simRef.current;
+        if (sim0) {
+          sim0.nodes(nodesRef.current);
+          sim0.alpha(0.5).restart();
+        }
+
+        if (hoveredIdRef.current && toRemove.has(hoveredIdRef.current)) {
+          hoveredIdRef.current = null;
+          setHovered(null);
+        }
+      }
+
+      const nodes = nodesRef.current;
 
       ctx.clearRect(0, 0, width, height);
 
@@ -474,11 +588,12 @@ export function BubbleMap() {
       let maxX = Number.NEGATIVE_INFINITY;
       let maxY = Number.NEGATIVE_INFINITY;
 
-      for (const n of next) {
-        minX = Math.min(minX, n.x - n.r);
-        minY = Math.min(minY, n.y - n.r);
-        maxX = Math.max(maxX, n.x + n.r);
-        maxY = Math.max(maxY, n.y + n.r);
+      for (const n of nodes) {
+        const drawR = n.r * clamp(n.s, 0, 1.15);
+        minX = Math.min(minX, n.x - drawR);
+        minY = Math.min(minY, n.y - drawR);
+        maxX = Math.max(maxX, n.x + drawR);
+        maxY = Math.max(maxY, n.y + drawR);
       }
 
       const contentW = Math.max(1, maxX - minX);
@@ -498,24 +613,27 @@ export function BubbleMap() {
 
       const hoveredId = hoveredIdRef.current;
 
-      for (const n of next) {
+      for (const n of nodes) {
         const isHover = hoveredId === n.id;
         const base = pickColor(n.chainId, n.tokenAddress, stale);
+        const drawR = n.r * clamp(n.s, 0, 1.15);
+        const drawAlpha = clamp(n.s, 0, 1);
 
         const light = rgba({ r: 255, g: 255, b: 255, a: stale ? 0.18 : 0.28 });
         const mid = rgba(base);
         const dark = rgba(scaleRgb(base, 0.35));
 
-        const grad = ctx.createRadialGradient(n.x - n.r * 0.25, n.y - n.r * 0.25, n.r * 0.2, n.x, n.y, n.r);
+        const grad = ctx.createRadialGradient(n.x - drawR * 0.25, n.y - drawR * 0.25, drawR * 0.2, n.x, n.y, drawR);
         grad.addColorStop(0, light);
         grad.addColorStop(0.45, mid);
         grad.addColorStop(1, dark);
 
         ctx.save();
+        ctx.globalAlpha = drawAlpha;
         ctx.beginPath();
-        ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+        ctx.arc(n.x, n.y, drawR, 0, Math.PI * 2);
 
-        ctx.shadowBlur = isHover ? n.r * 0.85 : n.r * 0.6;
+        ctx.shadowBlur = isHover ? drawR * 0.85 : drawR * 0.6;
         ctx.shadowColor = rgba({ ...base, a: stale ? 0.35 : 0.55 });
 
         ctx.fillStyle = grad;
@@ -530,8 +648,8 @@ export function BubbleMap() {
         const iconUrl = n.iconUrl;
         const img = iconUrl ? cache.get(iconUrl) : undefined;
 
-        const iconCenterY = n.y - n.r * 0.32;
-        const iconRadius = n.r * 0.34;
+        const iconCenterY = n.y - drawR * 0.32;
+        const iconRadius = drawR * 0.34;
 
         if (img && img.complete && img.naturalWidth > 0) {
           const sizePx = iconRadius * 2;
@@ -545,16 +663,16 @@ export function BubbleMap() {
 
         const displayName = n.name || n.symbol || n.label;
         const nameTextRaw = displayName.length > 14 && n.symbol ? n.symbol : displayName;
-        const nameFontSize = Math.round(Math.max(12, Math.min(20, n.r / 3)));
-        const nameTextY = n.y + n.r * 0.05;
+        const nameFontSize = Math.round(Math.max(12, Math.min(20, drawR / 3)));
+        const nameTextY = n.y + drawR * 0.05;
 
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
 
         ctx.font = `700 ${nameFontSize}px Verdana, Arial, sans-serif`;
-        const nameText = fitText(ctx, nameTextRaw, n.r * 1.55);
+        const nameText = fitText(ctx, nameTextRaw, drawR * 1.55);
 
-        ctx.lineWidth = Math.max(2, Math.round(n.r / 18));
+        ctx.lineWidth = Math.max(2, Math.round(drawR / 18));
         ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
         ctx.strokeText(nameText, n.x, nameTextY);
 
@@ -563,8 +681,8 @@ export function BubbleMap() {
 
         const mc = typeof n.marketCap === "number" ? n.marketCap : 0;
         const mcText = mc > 0 ? `$${formatMarketCap(mc)}` : "—";
-        const mcFontSize = Math.round(Math.max(10, Math.min(16, n.r / 4)));
-        const mcY = n.y + n.r * 0.35;
+        const mcFontSize = Math.round(Math.max(10, Math.min(16, drawR / 4)));
+        const mcY = n.y + drawR * 0.35;
 
         ctx.font = `600 ${mcFontSize}px Verdana, Arial, sans-serif`;
         ctx.fillStyle = "rgba(255, 255, 255, 0.78)";
@@ -582,7 +700,7 @@ export function BubbleMap() {
     return () => {
       window.cancelAnimationFrame(rafId);
     };
-  }, [filteredNodes, stale, size.height, size.width]);
+  }, [filteredNodes, query, stale, size.height, size.width]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -609,7 +727,8 @@ export function BubbleMap() {
       for (const n of nodes) {
         const dx = sx - n.x;
         const dy = sy - n.y;
-        if (dx * dx + dy * dy <= n.r * n.r) {
+        const rr = n.r * clamp(n.s ?? 1, 0, 1.15);
+        if (dx * dx + dy * dy <= rr * rr) {
           best = n;
           break;
         }

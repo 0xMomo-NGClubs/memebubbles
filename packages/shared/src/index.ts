@@ -42,3 +42,13 @@ export type TopBoostBubblesResponse = {
   stale: boolean;
   data: BubbleNode[];
 };
+
+export type RecentBoostBubblesResponse = {
+  source: "dexscreener";
+  endpoint: "/token-boosts/top/v1";
+  mode: "recent";
+  limit: number;
+  updatedAt: string;
+  stale: boolean;
+  data: BubbleNode[];
+};

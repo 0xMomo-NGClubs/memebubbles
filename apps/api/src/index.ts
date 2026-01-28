@@ -4,7 +4,12 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
-import type { BubbleNode, DexscreenerTopBoost, TopBoostBubblesResponse } from "@memebubbles/shared";
+import type {
+  BubbleNode,
+  DexscreenerTopBoost,
+  RecentBoostBubblesResponse,
+  TopBoostBubblesResponse
+} from "@memebubbles/shared";
 
 if (process.env.NODE_ENV !== "production") {
   dotenv.config();
@@ -72,6 +77,18 @@ type CacheState = {
   data: BubbleNode[];
 };
 
+type RecentEntry = {
+  key: string;
+  boost: DexscreenerTopBoost;
+  lastSeenAtMs: number;
+  meta?: TokenMeta;
+};
+
+type RecentCacheState = {
+  updatedAtMs: number;
+  data: BubbleNode[];
+};
+
 type Cache = {
   latest: CacheState | null;
   inFlight: Promise<CacheState> | null;
@@ -86,8 +103,29 @@ const cache: Cache = {
   lastAttemptedAtMs: null
 };
 
+const RECENT_CAPACITY = 100;
+const RECENT_TTL_MS = 6 * 60 * 60 * 1000;
+
+const recentCache: {
+  latest: RecentCacheState | null;
+  inFlight: Promise<RecentCacheState> | null;
+  lastError: unknown;
+  lastAttemptedAtMs: number | null;
+  entries: Map<string, RecentEntry>;
+} = {
+  latest: null,
+  inFlight: null,
+  lastError: null,
+  lastAttemptedAtMs: null,
+  entries: new Map()
+};
+
 const querySchema = z.object({
   limit: z.coerce.number().int().min(1).max(30).default(30)
+});
+
+const recentQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(RECENT_CAPACITY).default(RECENT_CAPACITY)
 });
 
 function sleep(ms: number) {
@@ -327,6 +365,43 @@ function parsePairAddressFromUrl(url: string, chainId: string) {
   }
 }
 
+type TokenKey =
+  | {
+      kind: "pair";
+      chainId: string;
+      pairAddress: string;
+    }
+  | {
+      kind: "token";
+      chainId: string;
+      tokenAddress: string;
+    };
+
+function tokenKeyToString(k: TokenKey) {
+  if (k.kind === "pair") {
+    return `${k.chainId.toLowerCase()}:${k.pairAddress.toLowerCase()}`;
+  }
+
+  return `${k.chainId.toLowerCase()}:token:${k.tokenAddress.toLowerCase()}`;
+}
+
+function boostToTokenKey(boost: DexscreenerTopBoost) {
+  const pairAddress = parsePairAddressFromUrl(boost.url, boost.chainId);
+  if (pairAddress) {
+    return {
+      kind: "pair" as const,
+      chainId: boost.chainId,
+      pairAddress
+    };
+  }
+
+  return {
+    kind: "token" as const,
+    chainId: boost.chainId,
+    tokenAddress: boost.tokenAddress
+  };
+}
+
 type PairKey = { chainId: string; pairAddress: string };
 
 function pairKeyToString(p: PairKey) {
@@ -412,6 +487,66 @@ async function fetchPairsMetaMap(pairs: PairKey[]): Promise<Map<string, TokenMet
   return out;
 }
 
+async function fetchPairsMetaByPairKey(pairs: PairKey[]): Promise<Map<string, TokenMeta>> {
+  const schema = z.object({
+    pairs: z.array(
+      z.object({
+        chainId: z.string(),
+        pairAddress: z.string(),
+        baseToken: z.object({
+          address: z.string(),
+          name: z.string().optional(),
+          symbol: z.string().optional()
+        }),
+        info: z
+          .object({
+            imageUrl: z.string().url().optional(),
+            header: z.string().url().optional()
+          })
+          .optional(),
+        marketCap: z.number().optional(),
+        fdv: z.number().optional()
+      })
+    )
+  });
+
+  const timeoutMs = Number(process.env.DEXSCREENER_TIMEOUT_MS ?? 8000);
+
+  const uniq = new Map<string, PairKey>();
+  for (const p of pairs) {
+    uniq.set(pairKeyToString(p), p);
+  }
+
+  const uniqPairs = Array.from(uniq.values());
+
+  const metas = await mapLimit(uniqPairs, 6, async (p) => {
+    const url = `${DEXSCREENER_LATEST_PAIRS_BASE_URL}/${p.chainId}/${p.pairAddress}`;
+    const json = await httpsGetJson(url, timeoutMs);
+    const parsed = schema.parse(json);
+    const first = parsed.pairs[0];
+    if (!first) return null;
+
+    const meta: TokenMeta = {
+      name: first.baseToken.name,
+      symbol: first.baseToken.symbol,
+      imageUrl: first.info?.imageUrl,
+      headerImageUrl: first.info?.header,
+      marketCap: first.marketCap ?? first.fdv,
+      pairAddress: first.pairAddress
+    };
+
+    return { key: pairKeyToString(p), meta };
+  }).catch(() => []);
+
+  const out = new Map<string, TokenMeta>();
+  for (const m of metas) {
+    if (!m) continue;
+    out.set(m.key, m.meta);
+  }
+
+  return out;
+}
+
 async function refreshTopBoostBubbles(limit: number): Promise<CacheState> {
   cache.lastAttemptedAtMs = Date.now();
 
@@ -451,6 +586,149 @@ async function refreshTopBoostBubbles(limit: number): Promise<CacheState> {
   cache.latest = state;
   cache.lastError = null;
   return state;
+}
+
+function mapBoostToRecentBubbleNode(entry: RecentEntry, rank: number): BubbleNode {
+  const meta = entry.meta;
+  return {
+    ...mapBoostToBubbleNode(entry.boost, rank, meta),
+    id: entry.key,
+    rank
+  };
+}
+
+async function refreshRecentBoostBubbles(): Promise<RecentCacheState> {
+  recentCache.lastAttemptedAtMs = Date.now();
+  const now = Date.now();
+
+  const boosts = await fetchTopBoostsFromDexscreener();
+
+  const addrs = boosts.map((b) => b.tokenAddress);
+  const tokenMetaMap = await fetchTokenMetaMap(addrs).catch(() => new Map());
+
+  const pairsToFetch: PairKey[] = [];
+
+  for (const b of boosts) {
+    const key = boostToTokenKey(b);
+    const keyStr = tokenKeyToString(key);
+
+    const existing = recentCache.entries.get(keyStr);
+    const next: RecentEntry = {
+      key: keyStr,
+      boost: b,
+      lastSeenAtMs: now,
+      meta: existing?.meta
+    };
+
+    recentCache.entries.set(keyStr, next);
+
+    const addr = b.tokenAddress.toLowerCase();
+
+    const parsedPair = key.kind === "pair" ? key.pairAddress : undefined;
+    if (parsedPair) {
+      const current = tokenMetaMap.get(addr);
+      tokenMetaMap.set(addr, { ...(current ?? {}), pairAddress: parsedPair });
+      pairsToFetch.push({ chainId: b.chainId, pairAddress: parsedPair });
+      continue;
+    }
+
+    const pairAddress = tokenMetaMap.get(addr)?.pairAddress;
+    if (pairAddress) {
+      pairsToFetch.push({ chainId: b.chainId, pairAddress });
+    }
+  }
+
+  const pairMetaByPairKey = await fetchPairsMetaByPairKey(pairsToFetch).catch(() => new Map());
+
+  for (const [keyStr, entry] of recentCache.entries) {
+    if (now - entry.lastSeenAtMs > RECENT_TTL_MS) {
+      recentCache.entries.delete(keyStr);
+      continue;
+    }
+
+    const addr = entry.boost.tokenAddress.toLowerCase();
+
+    const tokenKey = boostToTokenKey(entry.boost);
+    const pairKey = tokenKey.kind === "pair" ? pairKeyToString({ chainId: tokenKey.chainId, pairAddress: tokenKey.pairAddress }) : undefined;
+
+    const meta = (pairKey ? pairMetaByPairKey.get(pairKey) : undefined) ?? tokenMetaMap.get(addr) ?? entry.meta;
+
+    if (meta) {
+      entry.meta = meta;
+    }
+  }
+
+  const sorted = Array.from(recentCache.entries.values()).sort((a, b) => b.lastSeenAtMs - a.lastSeenAtMs);
+
+  if (sorted.length > RECENT_CAPACITY) {
+    const keep = new Set(sorted.slice(0, RECENT_CAPACITY).map((x) => x.key));
+    for (const key of recentCache.entries.keys()) {
+      if (!keep.has(key)) {
+        recentCache.entries.delete(key);
+      }
+    }
+  }
+
+  const finalSorted = Array.from(recentCache.entries.values()).sort((a, b) => b.lastSeenAtMs - a.lastSeenAtMs);
+  const nodes = finalSorted.map((e, idx) => mapBoostToRecentBubbleNode(e, idx + 1));
+
+  const state: RecentCacheState = { updatedAtMs: Date.now(), data: nodes };
+  recentCache.latest = state;
+  recentCache.lastError = null;
+  return state;
+}
+
+function ensureRecentRefreshInBackground(
+  log?: { info: (obj: unknown, msg: string) => void; warn: (obj: unknown, msg: string) => void }
+) {
+  if (recentCache.inFlight) return;
+
+  recentCache.inFlight = (async () => {
+    try {
+      const state = await refreshRecentBoostBubbles();
+      log?.info({ updatedAt: state.updatedAtMs }, "Dexscreener recent 刷新成功");
+      return state;
+    } catch (err) {
+      recentCache.lastError = err;
+      log?.warn({ err }, "Dexscreener recent 刷新失败");
+      throw err;
+    } finally {
+      recentCache.inFlight = null;
+    }
+  })();
+
+  void recentCache.inFlight.catch(() => undefined);
+}
+
+async function getRecentBoostBubbles(opts: { freshTtlMs: number; staleTtlMs: number; log?: { info: (obj: unknown, msg: string) => void; warn: (obj: unknown, msg: string) => void } }) {
+  const now = Date.now();
+  const latest = recentCache.latest;
+
+  if (latest && now - latest.updatedAtMs <= opts.freshTtlMs) {
+    return { state: latest, stale: false };
+  }
+
+  if (latest && now - latest.updatedAtMs <= opts.staleTtlMs) {
+    ensureRecentRefreshInBackground(opts.log);
+    return { state: latest, stale: true };
+  }
+
+  if (recentCache.inFlight) {
+    const state = await recentCache.inFlight;
+    return { state, stale: false };
+  }
+
+  recentCache.inFlight = refreshRecentBoostBubbles()
+    .catch((err) => {
+      recentCache.lastError = err;
+      throw err;
+    })
+    .finally(() => {
+      recentCache.inFlight = null;
+    });
+
+  const state = await recentCache.inFlight;
+  return { state, stale: false };
 }
 
 function ensureRefreshInBackground(
@@ -576,6 +854,46 @@ async function main() {
     }
   });
 
+  fastify.get("/api/v1/bubbles/recent", async (request, reply) => {
+    const parse = recentQuerySchema.safeParse(request.query);
+    if (!parse.success) {
+      return reply.status(400).send({
+        message: "参数不合法",
+        issues: parse.error.issues
+      });
+    }
+
+    const { limit } = parse.data;
+
+    try {
+      const { state, stale } = await getRecentBoostBubbles({
+        freshTtlMs: 30_000,
+        staleTtlMs: 120_000,
+        log: {
+          info: (obj, msg) => request.log.info(obj as object, msg),
+          warn: (obj, msg) => request.log.warn(obj as object, msg)
+        }
+      });
+
+      const payload: RecentBoostBubblesResponse = {
+        source: "dexscreener",
+        endpoint: "/token-boosts/top/v1",
+        mode: "recent",
+        limit,
+        updatedAt: new Date(state.updatedAtMs).toISOString(),
+        stale,
+        data: state.data.slice(0, limit)
+      };
+
+      return reply.send(payload);
+    } catch (err) {
+      request.log.error({ err }, "拉取 Dexscreener recent 失败");
+      return reply.status(502).send({
+        message: "上游数据源暂不可用，请稍后再试"
+      });
+    }
+  });
+
   const port = env.PORT ?? 3001;
   const host = env.HOST ?? "0.0.0.0";
 
@@ -586,6 +904,10 @@ async function main() {
       if (cache.latest === null) {
         ensureRefreshInBackground(30, fastify.log);
       }
+
+      if (recentCache.latest === null) {
+        ensureRecentRefreshInBackground(fastify.log);
+      }
     } catch {
       return;
     }
@@ -594,6 +916,7 @@ async function main() {
   void runSchedule();
   setInterval(() => {
     ensureRefreshInBackground(30, fastify.log);
+    ensureRecentRefreshInBackground(fastify.log);
   }, refreshIntervalMs);
 
   await fastify.listen({ port, host });

@@ -648,7 +648,7 @@ export function BubbleMap() {
           ctx.restore();
         }
 
-        const displayName = n.name || n.symbol || n.label;
+        const displayName = n.symbol || n.label;
         const nameTextRaw = displayName.length > 14 && n.symbol ? n.symbol : displayName;
         const nameFontSize = Math.round(Math.max(12, Math.min(20, drawR / 3)));
         const nameTextY = n.y + drawR * 0.05;
